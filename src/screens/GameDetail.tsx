@@ -108,6 +108,72 @@ function uniqueLines(lines: PlayerGameStats[]): PlayerGameStats[] {
   });
 }
 
+export interface LineupSplit {
+  /** true solo si hay un quinteto inicial completo y coherente con el acta. */
+  hasLineup: boolean;
+  starters: PlayerGameStats[];
+  bench: PlayerGameStats[];
+  /** IDs declarados como titulares que no aparecen en el acta (datos incoherentes). */
+  missingStarterIds: string[];
+  /** true cuando el partido no guardó el campo de quintetos iniciales. */
+  absent: boolean;
+}
+
+/**
+ * P1 — Separa titulares y suplentes usando `Game.startingLineups` como fuente de
+ * verdad. Nunca se usa el orden de rotación ni los cinco primeros del acta.
+ *
+ * Reglas:
+ * - Solo se acepta un quinteto de exactamente 5 IDs distintos y presentes en el acta.
+ * - Si el campo falta, llega vacío, no tiene 5 entradas, repite IDs o referencia a
+ *   jugadores que no disputaron el partido, no se marca a nadie como titular
+ *   (`hasLineup: false`): no se inventan titulares.
+ * - `starters` y `bench` son siempre una partición exacta de `participants`, de modo
+ *   que ningún jugador se duplica ni desaparece y conserva todas sus estadísticas.
+ */
+export function splitBoxScoreByStartingLineup(
+  participants: PlayerGameStats[],
+  startingLineup?: readonly string[] | null,
+): LineupSplit {
+  const byId = new Map(participants.map((line) => [line.playerId, line]));
+  const requested = Array.isArray(startingLineup) ? startingLineup : [];
+  const seen = new Set<string>();
+  const orderedIds: string[] = [];
+  const missingStarterIds: string[] = [];
+
+  for (const id of requested) {
+    if (typeof id !== "string" || !id) continue;
+    const line = byId.get(id);
+    if (!line) {
+      missingStarterIds.push(id);
+      continue;
+    }
+    if (seen.has(id)) continue;
+    seen.add(id);
+    orderedIds.push(id);
+  }
+
+  const complete = requested.length === 5 && orderedIds.length === 5;
+  if (!complete) {
+    return {
+      hasLineup: false,
+      absent: requested.length === 0,
+      starters: [],
+      // Sin quinteto fiable, todo el acta se presenta junta.
+      bench: participants,
+      missingStarterIds,
+    };
+  }
+
+  return {
+    hasLineup: true,
+    absent: false,
+    starters: orderedIds.map((id) => byId.get(id) as PlayerGameStats),
+    bench: participants.filter((line) => !seen.has(line.playerId)),
+    missingStarterIds,
+  };
+}
+
 function gameWinners(game: Game): { home: boolean; away: boolean } {
   if (!game.played || game.homeScore === undefined || game.awayScore === undefined) return { home: false, away: false };
   return { home: game.homeScore > game.awayScore, away: game.awayScore > game.homeScore };
@@ -217,8 +283,8 @@ export function GameDetailScreen({
           <>
             <TeamComparisonBox game={game} homeTeam={homeTeam} awayTeam={awayTeam} season={season} />
             <div className="mt-3 space-y-3">
-              <TeamBoxSection team={awayTeam} box={box.away} score={game.awayScore ?? 0} won={winners.away} roster={awayRoster} label="Visitante" season={season} />
-              <TeamBoxSection team={homeTeam} box={box.home} score={game.homeScore ?? 0} won={winners.home} roster={homeRoster} label="Local" season={season} />
+              <TeamBoxSection team={awayTeam} box={box.away} score={game.awayScore ?? 0} won={winners.away} roster={awayRoster} label="Visitante" season={season} startingLineup={game.startingLineups?.away} />
+              <TeamBoxSection team={homeTeam} box={box.home} score={game.homeScore ?? 0} won={winners.home} roster={homeRoster} label="Local" season={season} startingLineup={game.startingLineups?.home} />
             </div>
 
             <PlayByPlaySection
@@ -425,16 +491,16 @@ function TeamComparisonBox({ game, homeTeam, awayTeam, season }: {
   );
 }
 
-function TeamBoxSection({ team, box, score, won, roster, label, season }: {
+function TeamBoxSection({ team, box, score, won, roster, label, season, startingLineup }: {
   team: Team; box: TeamBoxScore; score: number; won: boolean; roster: Player[]; label: string; season: string;
+  startingLineup?: readonly string[];
 }) {
   const rosterById = useMemo(() => new Map(roster.map((player) => [player.id, player])), [roster]);
-  // El motor guarda a los jugadores en orden de rotación: los cinco primeros son los titulares.
-  // No se reordena por minutos para no perder esa separación titular/suplente.
+  // P1: titulares y suplentes se separan con el quinteto inicial guardado en el
+  // partido (`Game.startingLineups`). El orden de rotación ya no se usa como sustituto.
   const participants = uniqueLines(box.players ?? []);
   const participantIds = new Set(participants.map((line) => line.playerId));
-  const starters = participants.slice(0, 5);
-  const bench = participants.slice(5);
+  const { hasLineup, starters, bench, absent } = splitBoxScoreByStartingLineup(participants, startingLineup);
   const dnp = roster.filter((player) => !participantIds.has(player.id));
   const totals = sum(participants);
   const expected = { points: box.points, fgm: box.fgm, fga: box.fga, tpm: box.tpm, tpa: box.tpa, ftm: box.ftm, fta: box.fta, oreb: box.oreb, reb: box.reb, ast: box.ast, stl: box.stl, blk: box.blk, tov: box.tov, pf: box.pf };
@@ -450,7 +516,16 @@ function TeamBoxSection({ team, box, score, won, roster, label, season }: {
             <div className="text-[0.52rem] font-bold uppercase tracking-[0.1em] text-[var(--muted)]">{season} · {label}</div>
             <div className="truncate text-sm font-extrabold tracking-[-0.02em]">{team.city} {team.name}</div>
             <div className="flex flex-wrap items-center gap-1 text-[0.52rem] uppercase tracking-wide text-[var(--muted)]">
-              <span>{starters.length + bench.length} en acta</span><span>·</span><span>{starters.length} titulares</span><span>·</span><span>{bench.length} suplentes</span>{twoWay > 0 && <><span>·</span><span>{twoWay} two-way</span></>}
+              <span>{participants.length} en acta</span>
+              <span>·</span>
+              {hasLineup ? (
+                <>
+                  <span>{starters.length} titulares</span><span>·</span><span>{bench.length} suplentes</span>
+                </>
+              ) : (
+                <span className="chip chip-warn" title="El partido no guardó un quinteto inicial válido: el acta se muestra sin separar titulares y suplentes.">Sin quinteto inicial registrado</span>
+              )}
+              {twoWay > 0 && <><span>·</span><span>{twoWay} two-way</span></>}
               {won && <span className="chip chip-solid">Victoria</span>}
             </div>
           </div>
@@ -477,10 +552,19 @@ function TeamBoxSection({ team, box, score, won, roster, label, season }: {
             </tr>
           </thead>
           <tbody>
-            <BoxGroupRow label="Titulares" />
-            {starters.map((line) => <PlayerBoxRow key={line.playerId} line={line} rosterPlayer={rosterById.get(line.playerId)} />)}
-            {bench.length > 0 && <BoxGroupRow label="Suplentes" />}
-            {bench.map((line) => <PlayerBoxRow key={line.playerId} line={line} rosterPlayer={rosterById.get(line.playerId)} />)}
+            {hasLineup ? (
+              <>
+                <BoxGroupRow label="Titulares" />
+                {starters.map((line) => <PlayerBoxRow key={line.playerId} line={line} rosterPlayer={rosterById.get(line.playerId)} />)}
+                {bench.length > 0 && <BoxGroupRow label="Suplentes" />}
+                {bench.map((line) => <PlayerBoxRow key={line.playerId} line={line} rosterPlayer={rosterById.get(line.playerId)} />)}
+              </>
+            ) : (
+              <>
+                <BoxGroupRow label="Acta del partido · sin quinteto inicial registrado" />
+                {participants.map((line) => <PlayerBoxRow key={line.playerId} line={line} rosterPlayer={rosterById.get(line.playerId)} />)}
+              </>
+            )}
             {dnp.length > 0 && <BoxGroupRow label="No participaron" />}
             {dnp.map((player) => (
               <tr key={player.id} className="bb-dnp-row" data-dnp="true">
@@ -513,7 +597,15 @@ function TeamBoxSection({ team, box, score, won, roster, label, season }: {
       </div>
 
       <div className="border-t border-[var(--line)] px-3 py-2 text-[0.55rem] leading-relaxed text-[var(--muted)] sm:px-4">
-        <p>Titulares: primeros cinco del orden de rotación guardado en este partido. Suplentes: resto del acta. DNP: no disputó minutos. La app no modela lesiones, suspensiones ni inactivos; no se atribuyen motivos médicos.</p>
+        <p>Titulares: quinteto inicial guardado en los datos del partido («startingLineups»), no el orden de rotación. Suplentes: resto del acta. DNP: no disputó minutos. La app no modela lesiones, suspensiones ni inactivos; no se atribuyen motivos médicos.</p>
+        {!hasLineup && (
+          <p className="mt-1">
+            {absent
+              ? "Este partido se guardó sin quinteto inicial (partidas anteriores a la Fase 3)."
+              : "El quinteto inicial guardado no es coherente con el acta (faltan o sobran jugadores, o hay IDs repetidos)."}
+            {" "}El acta se muestra sin separar titulares y suplentes para no inventar datos.
+          </p>
+        )}
         <p className="mt-1">BA (bloqueos recibidos) y +/- no los registra el motor de esta fase: se muestran como «—» y no se inventan. GmSc = Game Score de Hollinger, calculado con las estadísticas de esta tabla. MP son minutos enteros.</p>
       </div>
     </section>
